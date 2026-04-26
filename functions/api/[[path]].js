@@ -4,12 +4,9 @@ export async function onRequest(context) {
     const method = request.method;
     const action = params.path ? params.path[0] : ''; 
     
-    // Pages 环境变量密码 (默认 admin)
     const ADMIN_PASS = env.ADMIN_PASSWORD || "admin"; 
-    // D1 数据库实例绑定
     const db = env.DB; 
 
-    // --- [探针/Agent 公开接口] ---
     if (action === "report" && method === "POST") {
         const data = await request.json(); 
         await db.prepare("UPDATE servers SET cpu = ?, mem = ?, last_report = ? WHERE ip = ?")
@@ -23,7 +20,6 @@ export async function onRequest(context) {
         
         const { results: machineNodes } = await db.prepare("SELECT * FROM nodes WHERE vps_ip = ?").bind(ip).all();
         
-        // 组装链式代理 (内部节点) 的目标配置参数
         for (let node of machineNodes) {
             if (node.protocol === "dokodemo-door" && node.relay_type === "internal") {
                 const targetNode = await db.prepare("SELECT * FROM nodes WHERE id = ?").bind(node.target_id).first();
@@ -43,13 +39,52 @@ export async function onRequest(context) {
         return Response.json({ success: true, configs: machineNodes });
     }
 
+    if (action === "sub" && method === "GET") {
+        const ip = url.searchParams.get("ip");
+        const token = url.searchParams.get("token");
+
+        if (token !== ADMIN_PASS) return new Response("Invalid Sub Token", { status: 403 });
+
+        let query = "SELECT * FROM nodes";
+        let sqlParams = [];
+        if (ip) {
+            query += " WHERE vps_ip = ?";
+            sqlParams.push(ip);
+        }
+        
+        const { results: targetNodes } = await db.prepare(query).bind(...sqlParams).all();
+        
+        let subLinks = [];
+        for (let node of targetNodes) {
+            const vpsInfo = await db.prepare("SELECT name FROM servers WHERE ip = ?").bind(node.vps_ip).first();
+            const remark = encodeURIComponent(vpsInfo ? vpsInfo.name : "KUI_Node");
+
+            if (node.protocol === "VLESS") {
+                subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&security=none&type=tcp#${remark}`);
+            } else if (node.protocol === "Reality") {
+                subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${node.sni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id}&type=tcp&headerType=none#${remark}-Reality`);
+            } else if (node.protocol === "Hysteria2") {
+                subLinks.push(`hysteria2://${node.uuid}@${node.vps_ip}:${node.port}/?insecure=1&sni=bing.com#${remark}-Hy2`);
+            }
+        }
+
+        // 使用 unescape 和 encodeURIComponent 确保包含中文备注时 Base64 不会报错
+        const base64Sub = btoa(unescape(encodeURIComponent(subLinks.join('\n'))));
+        
+        return new Response(base64Sub, {
+            headers: {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-store"
+            }
+        });
+    }
+
     if (action === "login" && method === "POST") {
         const data = await request.json();
         if (data.password === ADMIN_PASS) return Response.json({ success: true });
         return Response.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // --- [管理平台鉴权接口] ---
     if (request.headers.get("Authorization") !== ADMIN_PASS) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
     try {
