@@ -245,6 +245,9 @@
                         payload.private_key = keys.privateKey;
                         payload.public_key = keys.publicKey;
                         payload.short_id = keys.shortId;
+                    } else if (params.protocol === 'Hysteria2') {
+                        const nicheDomains = ["www.chiba-u.ac.jp", "www.tsukuba.ac.jp", "www.jma.go.jp", "www.epfl.ch", "www.su.se", "www.tu-berlin.de", "www.cnrs.fr"];
+                        payload.sni = nicheDomains[Math.floor(Math.random() * nicheDomains.length)];
                     } else if (params.protocol === 'dokodemo-door') {
                         payload.relay_type = params.relay_type;
                         if (params.relay_type === 'external') {
