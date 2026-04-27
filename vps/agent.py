@@ -96,107 +96,20 @@ def fetch_and_apply_configs():
         res = urllib.request.urlopen(req, timeout=10)
         data = json.loads(res.read().decode('utf-8'))
         if data.get("success"):
-            server_info = data.get("server", {})
             nodes = data.get("configs", [])
-            build_singbox_config(nodes, server_info.get("unlock_proxy", ""))
+            build_singbox_config(nodes)
             return nodes
     except Exception:
         pass
     return []
 
-# =====================================================================
-# 🚀 还原为最稳定的官方 warp-cli 部署方案，包含完美自动化安装命令
-# =====================================================================
-def check_and_deploy_warp():
-    """安全、防卡死的 WARP 官方客户端自动部署与状态检查"""
-    try:
-        # 1. 检测是否安装，如果没有安装，就执行我们手动跑通的这套 Debian 安装指令
-        if subprocess.run("command -v warp-cli", shell=True, stderr=subprocess.DEVNULL).returncode != 0:
-            print("检测到 WARP 未安装，正在执行全自动部署...")
-            install_cmd = """
-            apt-get update && apt-get install -y curl gnupg lsb-release
-            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list
-            apt-get update && apt-get install -y cloudflare-warp
-            """
-            subprocess.run(install_cmd, shell=True, executable='/bin/bash')
-            time.sleep(3)
-
-        # 检查是否成功装上
-        if subprocess.run("command -v warp-cli", shell=True, stderr=subprocess.DEVNULL).returncode != 0:
-            print("WARP 自动安装失败，退出解锁配置。")
-            return False
-
-        # 2. 检测运行状态，如果卡死或未连接，就执行我们手动跑通的抢救指令
-        status = subprocess.check_output("warp-cli --accept-tos status", shell=True).decode()
-        if "Connected" not in status:
-            print("尝试初始化/重连 WARP SOCKS5...")
-            subprocess.run("warp-cli --accept-tos disconnect", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            subprocess.run("warp-cli --accept-tos registration delete", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            
-            subprocess.run("warp-cli --accept-tos registration new", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            subprocess.run("warp-cli --accept-tos mode proxy", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            subprocess.run("warp-cli --accept-tos proxy port 40000", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            subprocess.run("timeout 10 warp-cli --accept-tos connect", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            time.sleep(5) # 给一点时间分配 IP
-            
-            new_status = subprocess.check_output("warp-cli --accept-tos status", shell=True).decode()
-            if "Connected" not in new_status:
-                print("WARP 依然无法连接，放弃本次解锁配置注入。")
-                return False
-                
-        return True
-    except Exception as e:
-        print(f"WARP 自动部署异常: {e}")
-        return False
-# =====================================================================
-
-def build_singbox_config(nodes, unlock_proxy):
+def build_singbox_config(nodes):
     singbox_config = {
         "log": {"level": "warn"},
         "inbounds": [],
         "outbounds": [{"type": "direct", "tag": "direct-out"}],
         "route": {"rules": []}
     }
-
-    proxy_ip = ""
-    proxy_port = 0
-    
-    # 触发自动部署 WARP 或者自定义解锁端口
-    if unlock_proxy == "auto_warp":
-        if check_and_deploy_warp():
-            proxy_ip = "127.0.0.1"
-            proxy_port = 40000
-    elif unlock_proxy and ":" in unlock_proxy:
-        parts = unlock_proxy.strip().split(":")
-        try:
-            proxy_ip = parts[0]
-            proxy_port = int(parts[1])
-        except:
-            pass
-
-    # 【防崩溃关键逻辑】：只有当 proxy_ip 和 proxy_port 成功拿到时，才生成解锁路由
-    if proxy_ip and proxy_port:
-        try:
-            singbox_config["outbounds"].append({
-                "type": "socks", "tag": "media-unlock", "server": proxy_ip, "server_port": proxy_port
-            })
-            singbox_config["route"]["rules"].append({
-                "domain_suffix": [
-                    "netflix.com", "netflix.net", "nflximg.com", "nflximg.net", "nflxvideo.net", "nflxext.com", "nflxso.net",
-                    "disneyplus.com", "bamgrid.com", "dssott.com", "disneynow.com", "disneystreaming.com",
-                    "hbo.com", "hbomax.com", "hbomaxcdn.com", "max.com",
-                    "spotify.com", "scdn.co", "spoti.fi",
-                    "openai.com", "chatgpt.com", "ai.com", "auth0.com", "identrust.com",
-                    "anthropic.com", "claude.ai"
-                ],
-                "domain_keyword": [
-                    "netflix", "disneyplus", "openai", "chatgpt", "anthropic", "claude"
-                ],
-                "outbound": "media-unlock"
-            })
-        except Exception:
-            pass
 
     active_certs = []
 
