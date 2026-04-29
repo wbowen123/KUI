@@ -1,8 +1,20 @@
+# -*- coding: utf-8 -*-
 import urllib.request
 import json
 import os
 import time
 import subprocess
+import re
+import sys
+
+# ===============================================
+# 强制系统编码锁
+# ===============================================
+if sys.stdout.encoding != 'UTF-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 CONF_FILE = "/opt/kui/config.json"
 SINGBOX_CONF_PATH = "/etc/sing-box/config.json"
@@ -11,7 +23,7 @@ try:
     with open(CONF_FILE, 'r') as f:
         env = json.load(f)
 except Exception:
-    print("环境配置读取失败，请检查安装流程。")
+    print("Failed to read config file.")
     exit(1)
 
 API_URL = env["api_url"]
@@ -26,15 +38,160 @@ HEADERS = {
 }
 
 last_reported_bytes = {}
+argo_tunnels = {}
+prev_cpu_total = 0
+prev_cpu_idle = 0
+prev_rx = 0
+prev_tx = 0
 
+# ===============================================
+# Argo 全自动穿透核心模块
+# ===============================================
+def ensure_cloudflared():
+    if not os.path.exists("/usr/local/bin/cloudflared"):
+        print("First Argo node detected. Installing cloudflared silently...")
+        os.system("curl -L -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64")
+        os.system("chmod +x /usr/local/bin/cloudflared")
+
+def start_argo_tunnel(port):
+    ensure_cloudflared()
+    cmd = ["/usr/local/bin/cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"]
+    p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+    
+    url = None
+    start_time = time.time()
+    while time.time() - start_time < 15:
+        line = p.stderr.readline()
+        if not line: break
+        match = re.search(r'https://([a-zA-Z0-9-]+\.trycloudflare\.com)', line)
+        if match:
+            url = match.group(1)
+            break
+    return p, url
+
+def process_argo_nodes(configs):
+    argo_urls_to_report = []
+    expected_argo_ports = []
+    
+    for node in configs:
+        if node.get('protocol') == 'VLESS-Argo':
+            port = str(node['port'])
+            expected_argo_ports.append(port)
+            if port not in argo_tunnels:
+                p, url = start_argo_tunnel(port)
+                if url:
+                    argo_tunnels[port] = {"proc": p, "url": url}
+                    argo_urls_to_report.append({"id": node["id"], "url": url})
+            else:
+                argo_urls_to_report.append({"id": node["id"], "url": argo_tunnels[port]["url"]})
+                
+    for port in list(argo_tunnels.keys()):
+        if port not in expected_argo_ports:
+            argo_tunnels[port]["proc"].terminate()
+            del argo_tunnels[port]
+            
+    return argo_urls_to_report
+
+
+# ===============================================
+# 🌟 核心进化：纯 Python 原生内核抓取模块 (100%兼容所有Linux)
+# ===============================================
 def get_system_status():
+    global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx
+    stats = {
+        "cpu": 0, "mem": 0, "disk": 0, "uptime": "Unknown", 
+        "load": "0.00 0.00 0.00", "net_in_speed": 0, "net_out_speed": 0, 
+        "tcp_conn": 0, "udp_conn": 0
+    }
+    
+    # 1. 纯内核级 CPU 抓取
     try:
-        cpu = float(os.popen("top -bn1 | grep load | awk '{printf \"%.2f\", $(NF-2)}'").read().strip())
-        mem = float(os.popen("free -m | awk 'NR==2{printf \"%.2f\", $3*100/$2 }'").read().strip())
-        return {"cpu": int(cpu), "mem": mem}
-    except Exception:
-        return {"cpu": 0, "mem": 0}
+        with open('/proc/stat', 'r') as f:
+            for line in f:
+                if line.startswith('cpu '):
+                    parts = [float(p) for p in line.split()[1:]]
+                    idle = parts[3] + parts[4]
+                    total = sum(parts)
+                    if prev_cpu_total > 0:
+                        diff_total = total - prev_cpu_total
+                        diff_idle = idle - prev_cpu_idle
+                        if diff_total > 0:
+                            stats["cpu"] = int(100.0 * (1.0 - diff_idle / diff_total))
+                    prev_cpu_total = total
+                    prev_cpu_idle = idle
+                    break
+    except Exception: pass
 
+    # 2. 纯内核级 内存 抓取
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            mem_data = f.read()
+        total_match = re.search(r'MemTotal:\s+(\d+)', mem_data)
+        avail_match = re.search(r'MemAvailable:\s+(\d+)', mem_data)
+        if total_match and avail_match:
+            total = float(total_match.group(1))
+            avail = float(avail_match.group(1))
+            stats["mem"] = round(((total - avail) / total) * 100, 2)
+    except Exception: pass
+
+    # 3. 纯原生 磁盘使用率 抓取 (摆脱 df 命令)
+    try:
+        st = os.statvfs('/')
+        total_disk = st.f_blocks * st.f_frsize
+        used_disk = (st.f_blocks - st.f_bfree) * st.f_frsize
+        if total_disk > 0:
+            stats["disk"] = int((used_disk / total_disk) * 100)
+    except Exception: pass
+
+    # 4. 纯内核级 运行时长 抓取 (摆脱 uptime -p 报错)
+    try:
+        with open('/proc/uptime', 'r') as f:
+            uptime_seconds = float(f.readline().split()[0])
+            days = int(uptime_seconds // 86400)
+            hours = int((uptime_seconds % 86400) // 3600)
+            mins = int((uptime_seconds % 3600) // 60)
+            stats["uptime"] = f"{days} Day, {hours}:{mins:02d}"
+    except Exception: pass
+
+    # 5. 纯内核级 Load 抓取
+    try:
+        with open('/proc/loadavg', 'r') as f:
+            stats["load"] = " ".join(f.readline().split()[:3])
+    except Exception: pass
+
+    # 6. 连接数抓取 (保留 ss, 它在所有系统都很稳定)
+    try:
+        stats["tcp_conn"] = int(os.popen("ss -ant 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
+        stats["udp_conn"] = int(os.popen("ss -anu 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
+    except Exception: pass
+
+    # 7. 纯内核级 实时网速 抓取 (摆脱 awk 语法报错)
+    try:
+        rx_now = 0
+        tx_now = 0
+        with open('/proc/net/dev', 'r') as f:
+            lines = f.readlines()[2:]
+            for line in lines:
+                parts = line.split()
+                # 排除 loopback 本地回环网卡，只计算真实网卡流量
+                if len(parts) > 10 and not parts[0].startswith('lo'):
+                    rx_now += int(parts[1])
+                    tx_now += int(parts[9])
+        
+        if prev_rx > 0 and prev_tx > 0:
+            stats["net_in_speed"] = int((rx_now - prev_rx) / 60)
+            stats["net_out_speed"] = int((tx_now - prev_tx) / 60)
+        
+        prev_rx = rx_now
+        prev_tx = tx_now
+    except Exception: pass
+
+    return stats
+
+
+# ===============================================
+# 节点流量精准抓取模块
+# ===============================================
 def get_port_traffic(port, protocol="tcp"):
     try:
         check_in = f"iptables -C INPUT -p {protocol} --dport {port}"
@@ -55,10 +212,15 @@ def get_port_traffic(port, protocol="tcp"):
     except Exception:
         return 0
 
-def report_status(current_nodes):
+
+# ===============================================
+# 云端通讯模块
+# ===============================================
+def report_status(current_nodes, argo_urls):
     global last_reported_bytes
     status = get_system_status()
     status["ip"] = VPS_IP
+    status["argo_urls"] = argo_urls
     
     node_traffic_deltas = []
     current_ids = set()
@@ -67,7 +229,8 @@ def report_status(current_nodes):
         nid = node["id"]
         port = node["port"]
         current_ids.add(nid)
-        proto = "udp" if node["protocol"] == "Hysteria2" else "tcp"
+        # Hysteria2 和 TUIC 必须抓 UDP 流量
+        proto = "udp" if node["protocol"] in ["Hysteria2", "TUIC"] else "tcp"
         
         current_bytes = get_port_traffic(port, proto)
         last_bytes = last_reported_bytes.get(nid, 0)
@@ -101,8 +264,12 @@ def fetch_and_apply_configs():
             return nodes
     except Exception:
         pass
-    return []
+    return None
 
+
+# ===============================================
+# Sing-box 全协议底层配置引擎
+# ===============================================
 def build_singbox_config(nodes):
     singbox_config = {
         "log": {"level": "warn"},
@@ -115,14 +282,15 @@ def build_singbox_config(nodes):
 
     for node in nodes:
         in_tag = f"in-{node['id']}"
+        proto = node["protocol"]
         
-        if node["protocol"] == "VLESS":
+        if proto == "VLESS":
             singbox_config["inbounds"].append({
                 "type": "vless", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
                 "users": [{"uuid": node["uuid"]}]
             })
             
-        elif node["protocol"] == "Reality":
+        elif proto == "Reality":
             singbox_config["inbounds"].append({
                 "type": "vless", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
                 "users": [{"uuid": node["uuid"], "flow": "xtls-rprx-vision"}],
@@ -135,25 +303,45 @@ def build_singbox_config(nodes):
                 }
             })
 
-        elif node["protocol"] == "Hysteria2":
-            cert_path = f"/opt/kui/hy2_{node['id']}_cert.pem"
-            key_path = f"/opt/kui/hy2_{node['id']}_key.pem"
-            sni = node.get("sni", "www.chiba-u.ac.jp") 
+        elif proto in ["Hysteria2", "TUIC"]:
+            cert_path = f"/opt/kui/cert_{node['id']}.pem"
+            key_path = f"/opt/kui/key_{node['id']}.pem"
+            sni = node.get("sni", "www.apple.com")
             
-            active_certs.extend([f"hy2_{node['id']}_cert.pem", f"hy2_{node['id']}_key.pem"])
+            active_certs.extend([f"cert_{node['id']}.pem", f"key_{node['id']}.pem"])
 
             if not os.path.exists(cert_path) or not os.path.exists(key_path):
                 cmd = f'openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) -keyout {key_path} -out {cert_path} -days 3650 -subj "/O=GlobalSign/CN={sni}" 2>/dev/null'
                 subprocess.run(cmd, shell=True, executable='/bin/bash')
                 subprocess.run(["chmod", "644", cert_path, key_path])
 
+            if proto == "Hysteria2":
+                singbox_config["inbounds"].append({
+                    "type": "hysteria2", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
+                    "users": [{"password": node["uuid"]}],
+                    "tls": { "enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path }
+                })
+            elif proto == "TUIC":
+                singbox_config["inbounds"].append({
+                    "type": "tuic", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
+                    "users": [{"uuid": node["uuid"], "password": node["private_key"]}],
+                    "tls": { "enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path }
+                })
+
+        elif proto == "VLESS-Argo":
             singbox_config["inbounds"].append({
-                "type": "hysteria2", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                "users": [{"password": node["uuid"]}],
-                "tls": { "enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path }
+                "type": "vless", "tag": in_tag, "listen": "127.0.0.1", "listen_port": int(node["port"]),
+                "users": [{"uuid": node["uuid"]}],
+                "transport": {"type": "ws", "path": "/"}
             })
             
-        elif node["protocol"] == "dokodemo-door":
+        elif proto == "Socks5":
+            singbox_config["inbounds"].append({
+                "type": "socks", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
+                "users": [{"username": node["uuid"], "password": node["private_key"]}]
+            })
+            
+        elif proto == "dokodemo-door":
             singbox_config["inbounds"].append({ "type": "direct", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]) })
             out_tag = f"out-{node['id']}"
             
@@ -170,7 +358,7 @@ def build_singbox_config(nodes):
 
     try:
         for filename in os.listdir("/opt/kui/"):
-            if filename.startswith("hy2_") and filename.endswith(".pem"):
+            if (filename.startswith("cert_") or filename.startswith("key_")) and filename.endswith(".pem"):
                 if filename not in active_certs:
                     os.remove(os.path.join("/opt/kui/", filename))
     except Exception:
@@ -187,9 +375,23 @@ def build_singbox_config(nodes):
             f.write(new_config_str)
         subprocess.run(["systemctl", "restart", "sing-box"])
 
+
+# ===============================================
+# 主循环守护进程
+# ===============================================
 if __name__ == "__main__":
     current_active_nodes = []
+    
+    # 强制进行一次初始配置拉取
+    time.sleep(2)
+    
     while True:
-        current_active_nodes = fetch_and_apply_configs() or current_active_nodes
-        report_status(current_active_nodes)
+        fetched_nodes = fetch_and_apply_configs()
+        if fetched_nodes is not None:
+            current_active_nodes = fetched_nodes
+            
+        argo_urls = process_argo_nodes(current_active_nodes)
+        report_status(current_active_nodes, argo_urls)
+        
+        # 60 秒轮询心跳
         time.sleep(60)
