@@ -42,6 +42,8 @@ last_reported_bytes = {}
 argo_tunnels = {}
 prev_cpu_total = 0
 prev_cpu_idle = 0
+prev_rx = 0
+prev_tx = 0
 
 # ===============================================
 # Argo 全自动穿透核心模块
@@ -104,10 +106,14 @@ def process_argo_nodes(configs):
 # 高级系统监控模块 (已吸收 bash 探针核心精华算法)
 # ===============================================
 def get_system_status():
-    global prev_cpu_total, prev_cpu_idle
-    stats = {"cpu": 0, "mem": 0}
+    global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx
+    stats = {
+        "cpu": 0, "mem": 0, "disk": 0, "uptime": "Unknown", 
+        "load": "0.00 0.00 0.00", "net_in_speed": 0, "net_out_speed": 0, 
+        "tcp_conn": 0, "udp_conn": 0
+    }
     
-    # [精华吸收 1]：精确计算 CPU 使用率 (模拟 /proc/stat 的差值算法)
+    # 1. 精确计算 CPU 使用率 (模拟 /proc/stat 的差值算法)
     try:
         with open('/proc/stat', 'r') as f:
             for line in f:
@@ -126,19 +132,39 @@ def get_system_status():
                     prev_cpu_idle = idle
                     break
     except Exception:
-        # 降级备用方案
         try:
             cpu_val = os.popen("top -bn1 | grep load | awk '{printf \"%.2f\", $(NF-2)}'").read().strip()
             stats["cpu"] = int(float(cpu_val)) if cpu_val else 0
-        except:
-            pass
+        except: pass
 
-    # [精华吸收 2]：精确抓取内存真实使用率
+    # 2. 精确抓取内存与磁盘
+    try: stats["mem"] = float(os.popen("free -m | awk 'NR==2{printf \"%.2f\", $3*100/$2 }'").read().strip() or 0)
+    except Exception: pass
+    try: stats["disk"] = int(os.popen("df -hm / | tail -n1 | awk '{print $5}' | tr -d '%'").read().strip() or 0)
+    except Exception: pass
+
+    # 3. Uptime 与系统负载 Load
+    try: stats["uptime"] = os.popen("uptime -p | sed 's/up //'").read().strip()
+    except Exception: pass
+    try: stats["load"] = os.popen("cat /proc/loadavg | awk '{print $1, $2, $3}'").read().strip()
+    except Exception: pass
+
+    # 4. TCP/UDP 连接数
     try:
-        mem_val = os.popen("free -m | awk 'NR==2{printf \"%.2f\", $3*100/$2 }'").read().strip()
-        stats["mem"] = float(mem_val) if mem_val else 0
-    except Exception:
-        pass
+        stats["tcp_conn"] = int(os.popen("ss -ant 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
+        stats["udp_conn"] = int(os.popen("ss -anu 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
+    except Exception: pass
+
+    # 5. 精确到字节的网络实时测速
+    try:
+        net_stat = os.popen("awk 'NR>2 {rx+=$2; tx+=$10} END {printf \"%.0f %.0f\", rx, tx}' /proc/net/dev").read().strip().split()
+        if len(net_stat) == 2:
+            rx_now, tx_now = float(net_stat[0]), float(net_stat[1])
+            if prev_rx > 0 and prev_tx > 0:
+                stats["net_in_speed"] = int((rx_now - prev_rx) / 60) # 探针心跳周期为60秒
+                stats["net_out_speed"] = int((tx_now - prev_tx) / 60)
+            prev_rx, prev_tx = rx_now, tx_now
+    except Exception: pass
 
     return stats
 
