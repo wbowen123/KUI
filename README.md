@@ -121,7 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_traffic_ip_time ON traffic_stats(ip, timestamp);
 1. 浏览器访问你的控制台域名，输入管理员账号密码登录。
 2. 在 **[集群与节点]** 选项卡中，输入 VPS 别名与公网 IP，点击接入。
 3. 点击生成的机器卡片底部的 **[终端部署指令]**。
-4. SSH 登录到你的 VPS（推荐 Debian 11/12 或 Ubuntu 20.04+），**粘贴并回车**。
+4. SSH 登录到你的 VPS（推荐 Debian 12），**粘贴并回车**。
    *(指令自带前置环境检查，全自动拉取 Python 探针并运行。配置 1 分钟内生效，面板指示灯变绿 🟢)*
 
 > **📝 普通用户分发提示：**
