@@ -1,5 +1,5 @@
 // ==========================================
-// KUI 多用户聚合版 - Serverless 后端 API (绝对完整修复版)
+// KUI 多用户聚合版 - Serverless 后端 API (深度加固版)
 // ==========================================
 
 async function sha256(text) {
@@ -30,13 +30,14 @@ async function verifyAuth(authHeader, db, env) {
     const adminUser = env.ADMIN_USERNAME || "admin";
     const adminPass = env.ADMIN_PASSWORD || "admin";
 
-    // 静态 Token 兼容 (Agent/Sub)
+    // 静态 Token 兼容 (Agent)
     if (authHeader === adminPass || authHeader === await sha256(adminPass)) return adminUser;
 
     const parts = authHeader.split('.');
     if (parts.length !== 3) return null;
     const [b64User, timestamp, clientSig] = parts;
 
+    // 5分钟防重放窗口
     if (Math.abs(Date.now() - parseInt(timestamp)) > 300000) return null;
 
     const username = atob(b64User);
@@ -85,25 +86,26 @@ export async function onRequest(context) {
         return Response.json({ success: true });
     }
 
-    // 2. 🌟 Agent 拉取配置接口 (找回被误删的灵魂接口，VPS 没它无法上网)
+    // 2. Agent 拉取配置接口 (深度修复：兼容各种用户名变量变更情况)
     if (action === "config" && method === "GET") {
         if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         const ip = url.searchParams.get("ip");
         const now = Date.now();
         const adminUser = env.ADMIN_USERNAME || "admin";
 
-        // 筛选逻辑：节点正常 AND (所属用户是管理员 OR 所属普通用户状态正常)
         const query = `
             SELECT n.* FROM nodes n
             LEFT JOIN users u ON n.username = u.username
             WHERE n.vps_ip = ? AND n.enable = 1 
             AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit)
             AND (n.expire_time = 0 OR n.expire_time > ?)
-            AND (n.username = ? OR (
-                u.enable = 1 
-                AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit)
-                AND (u.expire_time = 0 OR u.expire_time > ?)
-            ))
+            AND (
+                n.username = ? OR n.username = 'admin' OR (
+                    u.username IS NOT NULL AND u.enable = 1 
+                    AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit)
+                    AND (u.expire_time = 0 OR u.expire_time > ?)
+                )
+            )
         `;
         const { results: machineNodes } = await db.prepare(query).bind(ip, now, adminUser, now).all();
         
@@ -116,7 +118,7 @@ export async function onRequest(context) {
         return Response.json({ success: true, configs: machineNodes });
     }
 
-    // 3. 聚合订阅接口 (修复：带上服务器美化别名)
+    // 3. 聚合订阅接口 (深度修复：管理员与普通用户 SQL 完全隔离，杜绝越权)
     if (action === "sub" && method === "GET") {
         const ip = url.searchParams.get("ip");
         const reqUser = url.searchParams.get("user");
@@ -125,7 +127,7 @@ export async function onRequest(context) {
 
         let isValid = false;
         if (reqUser === adminUser) {
-            isValid = (token === await sha256(env.ADMIN_PASSWORD));
+            isValid = (token === await sha256(env.ADMIN_PASSWORD || "admin")); // 修复了这里可能未定义的问题
         } else {
             const u = await db.prepare("SELECT password FROM users WHERE username = ?").bind(reqUser).first();
             if (u && token === u.password) isValid = true;
@@ -133,19 +135,25 @@ export async function onRequest(context) {
         if (!isValid) return new Response("Forbidden", { status: 403 });
 
         const now = Date.now();
-        let query = `
-            SELECT n.* FROM nodes n
-            LEFT JOIN users u ON n.username = u.username
-            WHERE n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit)
-            AND (n.expire_time = 0 OR n.expire_time > ?)
-            AND (n.username = ? OR (
-                u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit)
-                AND (u.expire_time = 0 OR u.expire_time > ?)
-            ))
-        `;
-        let sqlParams = [now, adminUser, now];
-        if (reqUser !== adminUser) { query = query.replace("n.username = ?", "n.username = ?"); sqlParams[1] = reqUser; }
-        if (ip) { query += " AND n.vps_ip = ?"; sqlParams.push(ip); }
+        let query;
+        let sqlParams = [now];
+
+        // 核心加固：权限物理隔离查询
+        if (reqUser === adminUser) {
+            query = `SELECT * FROM nodes WHERE enable = 1 AND (traffic_limit = 0 OR traffic_used < traffic_limit) AND (expire_time = 0 OR expire_time > ?) AND (username = ? OR username = 'admin')`;
+            sqlParams.push(adminUser);
+            if (ip) { query += " AND vps_ip = ?"; sqlParams.push(ip); }
+        } else {
+            query = `
+                SELECT n.* FROM nodes n 
+                JOIN users u ON n.username = u.username 
+                WHERE n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit) 
+                AND (n.expire_time = 0 OR n.expire_time > ?) 
+                AND n.username = ? AND u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) AND (u.expire_time = 0 OR u.expire_time > ?)
+            `;
+            sqlParams.push(reqUser, now);
+            if (ip) { query += " AND n.vps_ip = ?"; sqlParams.push(ip); }
+        }
 
         const { results } = await db.prepare(query).bind(...sqlParams).all();
         let subLinks = [];
@@ -172,7 +180,7 @@ export async function onRequest(context) {
     }
 
     // ==============================================
-    // 鉴权屏障 (以下均为面板后台操作接口)
+    // 面板内部接口屏障
     // ==============================================
     const currentUser = await verifyAuth(request.headers.get("Authorization"), db, env);
     const isAdmin = currentUser === (env.ADMIN_USERNAME || "admin");
@@ -213,6 +221,7 @@ export async function onRequest(context) {
             }
         }
         
+        // 深度修复：由于 D1 默认不支持外键级联，删除服务器时必须手动删除关联节点与流量，杜绝幽灵垃圾数据！
         if (action === "vps" && isAdmin) {
             if (method === "POST") {
                 const { ip, name } = await request.json();
@@ -220,7 +229,12 @@ export async function onRequest(context) {
                 return Response.json({ success: true });
             }
             if (method === "DELETE") {
-                await db.prepare("DELETE FROM servers WHERE ip = ?").bind(url.searchParams.get("ip")).run();
+                const ip = url.searchParams.get("ip");
+                await db.batch([
+                    db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip),
+                    db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip),
+                    db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip)
+                ]);
                 return Response.json({ success: true });
             }
         }
@@ -228,7 +242,12 @@ export async function onRequest(context) {
         if (action === "nodes" && isAdmin) {
             if (method === "POST") {
                 const n = await request.json();
-                await db.prepare(`INSERT INTO nodes (id, uuid, vps_ip, protocol, port, sni, private_key, public_key, short_id, relay_type, target_ip, target_port, target_id, enable, traffic_used, traffic_limit, expire_time, username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(n.id, n.uuid, n.vps_ip, n.protocol, n.port, n.sni||null, n.private_key||null, n.public_key||null, n.short_id||null, n.relay_type||null, n.target_ip||null, n.target_port||null, n.target_id||null, 1, 0, n.traffic_limit||0, n.expire_time||0, n.username||currentUser).run();
+                let nodeUser = n.username || currentUser;
+                if (nodeUser === 'admin') nodeUser = currentUser; // 规范化管理员名称
+                
+                await db.prepare(`INSERT INTO nodes (id, uuid, vps_ip, protocol, port, sni, private_key, public_key, short_id, relay_type, target_ip, target_port, target_id, enable, traffic_used, traffic_limit, expire_time, username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+                    n.id, n.uuid, n.vps_ip, n.protocol, n.port, n.sni||null, n.private_key||null, n.public_key||null, n.short_id||null, n.relay_type||null, n.target_ip||null, n.target_port||null, n.target_id||null, 1, 0, n.traffic_limit||0, n.expire_time||0, nodeUser
+                ).run();
                 return Response.json({ success: true });
             }
             if (method === "PUT") {
