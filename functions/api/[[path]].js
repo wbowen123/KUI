@@ -1,5 +1,5 @@
 // ==========================================
-// KUI 多用户聚合版 - Serverless 后端 API (深度加固版)
+// KUI Serverless 聚合网关后端 - 终极多用户全协议版 (含 Socks5)
 // ==========================================
 
 async function sha256(text) {
@@ -7,7 +7,6 @@ async function sha256(text) {
     return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 自动检测并热更新数据库结构
 async function ensureDbSchema(db) {
     try { await db.prepare("SELECT username FROM nodes LIMIT 1").first(); } 
     catch (e) { try { await db.prepare("ALTER TABLE nodes ADD COLUMN username TEXT DEFAULT 'admin'").run(); } catch(e){} }
@@ -24,20 +23,17 @@ async function ensureDbSchema(db) {
     }
 }
 
-// 多角色动态签名验证
 async function verifyAuth(authHeader, db, env) {
     if (!authHeader) return null;
     const adminUser = env.ADMIN_USERNAME || "admin";
     const adminPass = env.ADMIN_PASSWORD || "admin";
 
-    // 静态 Token 兼容 (Agent)
     if (authHeader === adminPass || authHeader === await sha256(adminPass)) return adminUser;
 
     const parts = authHeader.split('.');
     if (parts.length !== 3) return null;
     const [b64User, timestamp, clientSig] = parts;
 
-    // 5分钟防重放窗口
     if (Math.abs(Date.now() - parseInt(timestamp)) > 300000) return null;
 
     const username = atob(b64User);
@@ -65,7 +61,6 @@ export async function onRequest(context) {
     const action = params.path ? params.path[0] : ''; 
     const db = env.DB; 
 
-    // 1. Agent 上报接口 (同步累加用户总流量)
     if (action === "report" && method === "POST") {
         if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         const data = await request.json(); 
@@ -86,7 +81,6 @@ export async function onRequest(context) {
         return Response.json({ success: true });
     }
 
-    // 2. Agent 拉取配置接口 (深度修复：兼容各种用户名变量变更情况)
     if (action === "config" && method === "GET") {
         if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         const ip = url.searchParams.get("ip");
@@ -118,7 +112,6 @@ export async function onRequest(context) {
         return Response.json({ success: true, configs: machineNodes });
     }
 
-    // 3. 聚合订阅接口 (深度修复：管理员与普通用户 SQL 完全隔离，杜绝越权)
     if (action === "sub" && method === "GET") {
         const ip = url.searchParams.get("ip");
         const reqUser = url.searchParams.get("user");
@@ -127,7 +120,7 @@ export async function onRequest(context) {
 
         let isValid = false;
         if (reqUser === adminUser) {
-            isValid = (token === await sha256(env.ADMIN_PASSWORD || "admin")); // 修复了这里可能未定义的问题
+            isValid = (token === await sha256(env.ADMIN_PASSWORD || "admin"));
         } else {
             const u = await db.prepare("SELECT password FROM users WHERE username = ?").bind(reqUser).first();
             if (u && token === u.password) isValid = true;
@@ -138,7 +131,6 @@ export async function onRequest(context) {
         let query;
         let sqlParams = [now];
 
-        // 核心加固：权限物理隔离查询
         if (reqUser === adminUser) {
             query = `SELECT * FROM nodes WHERE enable = 1 AND (traffic_limit = 0 OR traffic_used < traffic_limit) AND (expire_time = 0 OR expire_time > ?) AND (username = ? OR username = 'admin')`;
             sqlParams.push(adminUser);
@@ -161,15 +153,27 @@ export async function onRequest(context) {
         for (let node of results) {
             const vpsInfo = await db.prepare("SELECT name FROM servers WHERE ip = ?").bind(node.vps_ip).first();
             const remark = encodeURIComponent(`${vpsInfo ? vpsInfo.name : 'KUI'} | ${node.protocol}_${node.port}`);
-            if (node.protocol === "VLESS") subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&security=none&type=tcp#${remark}`);
-            else if (node.protocol === "Reality") subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${node.sni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id}&type=tcp&headerType=none#${remark}-Reality`);
-            else if (node.protocol === "Hysteria2") subLinks.push(`hysteria2://${node.uuid}@${node.vps_ip}:${node.port}/?insecure=1&sni=${node.sni}#${remark}-Hy2`);
+            
+            if (node.protocol === "VLESS") {
+                subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&security=none&type=tcp#${remark}`);
+            } else if (node.protocol === "Reality") {
+                subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${node.sni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id}&type=tcp&headerType=none#${remark}-Reality`);
+            } else if (node.protocol === "Hysteria2") {
+                subLinks.push(`hysteria2://${node.uuid}@${node.vps_ip}:${node.port}/?insecure=1&sni=${node.sni}#${remark}-Hy2`);
+            } else if (node.protocol === "TUIC") {
+                subLinks.push(`tuic://${node.uuid}:${node.private_key}@${node.vps_ip}:${node.port}?sni=${node.sni}&congestion_control=bbr&alpn=h3#${remark}-TUIC`);
+            } else if (node.protocol === "VLESS-Argo") {
+                subLinks.push(`vless://${node.uuid}@${node.sni}:443?encryption=none&security=tls&type=ws&host=${node.sni}&path=%2F#${remark}-Argo`);
+            } else if (node.protocol === "Socks5") {
+                // 🌟 新增：Socks5 标准协议生成 (base64 编码 user:pass)
+                const auth = btoa(`${node.uuid}:${node.private_key}`);
+                subLinks.push(`socks5://${auth}@${node.vps_ip}:${node.port}#${remark}-Socks5`);
+            }
         }
 
         return new Response(btoa(unescape(encodeURIComponent(subLinks.join('\n')))), { headers: { "Content-Type": "text/plain; charset=utf-8" }});
     }
 
-    // 4. 登录接口
     if (action === "login" && method === "POST") {
         const username = await verifyAuth(request.headers.get("Authorization"), db, env);
         if (username) {
@@ -179,9 +183,6 @@ export async function onRequest(context) {
         return Response.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // ==============================================
-    // 面板内部接口屏障
-    // ==============================================
     const currentUser = await verifyAuth(request.headers.get("Authorization"), db, env);
     const isAdmin = currentUser === (env.ADMIN_USERNAME || "admin");
     if (!currentUser) return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -221,7 +222,6 @@ export async function onRequest(context) {
             }
         }
         
-        // 深度修复：由于 D1 默认不支持外键级联，删除服务器时必须手动删除关联节点与流量，杜绝幽灵垃圾数据！
         if (action === "vps" && isAdmin) {
             if (method === "POST") {
                 const { ip, name } = await request.json();
@@ -243,7 +243,7 @@ export async function onRequest(context) {
             if (method === "POST") {
                 const n = await request.json();
                 let nodeUser = n.username || currentUser;
-                if (nodeUser === 'admin') nodeUser = currentUser; // 规范化管理员名称
+                if (nodeUser === 'admin') nodeUser = currentUser; 
                 
                 await db.prepare(`INSERT INTO nodes (id, uuid, vps_ip, protocol, port, sni, private_key, public_key, short_id, relay_type, target_ip, target_port, target_id, enable, traffic_used, traffic_limit, expire_time, username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
                     n.id, n.uuid, n.vps_ip, n.protocol, n.port, n.sni||null, n.private_key||null, n.public_key||null, n.short_id||null, n.relay_type||null, n.target_ip||null, n.target_port||null, n.target_id||null, 1, 0, n.traffic_limit||0, n.expire_time||0, nodeUser
@@ -266,9 +266,6 @@ export async function onRequest(context) {
     } catch (err) { return Response.json({ error: err.message }, { status: 500 }); }
 }
 
-// ==========================================
-// Pages 原生内部定时触发器 (自动执行巡检)
-// ==========================================
 export async function onRequestScheduled(context) {
     const { env } = context;
     const db = env.DB;
@@ -287,5 +284,5 @@ export async function onRequestScheduled(context) {
             }
             if (updateStmts.length > 0) await db.batch(updateStmts);
         }
-    } catch (error) { console.error("巡检任务执行异常:", error); }
+    } catch (error) {}
 }
