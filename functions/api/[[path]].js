@@ -1,6 +1,6 @@
 // ==========================================
-// KUI Serverless 聚合网关后端 - 零配置全自动建表完全体
-// (包含：系统重命名 + 独立订阅 Token 解耦 + 心跳引擎)
+// KUI Serverless 聚合网关后端 - 完全体
+// (包含：自动建表升级 + 订阅 Token 解耦 + 按需心跳引擎)
 // ==========================================
 
 async function sha256(text) {
@@ -8,7 +8,7 @@ async function sha256(text) {
     return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 🌟 终极进化：全自动生成表结构与索引，无缝兼容老版本热升级
+// 🌟 全自动生成表结构与索引，无缝兼容老版本热升级
 async function ensureDbSchema(db) {
     const initQueries = [
         `CREATE TABLE IF NOT EXISTS servers (
@@ -65,7 +65,7 @@ async function ensureDbSchema(db) {
         )`,
         `CREATE INDEX IF NOT EXISTS idx_traffic_ip_time ON traffic_stats(ip, timestamp)`,
         
-        // 🌟 新增：系统配置表，用于记录前端面板的活跃心跳与全局设置
+        // 记录前端面板的活跃心跳与全局设置
         `CREATE TABLE IF NOT EXISTS sys_config (
             key TEXT PRIMARY KEY, 
             val TEXT, 
@@ -212,7 +212,7 @@ export async function onRequest(context) {
         
         if (stmts.length > 0) await db.batch(stmts);
 
-        // 🌟 将心跳检测结果传回探针，决定探针下一秒是否挂入“极速2秒挡”
+        // 🌟 将心跳检测结果传回探针，决定探针下一秒是否挂入“极速模式”
         let fastMode = false;
         try {
             const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first();
@@ -503,7 +503,7 @@ export async function onRequestScheduled(context) {
     const nowMs = Date.now();
     
     try {
-        // 查找超过 3 分钟 (180000ms) 未上报心跳，且还未发送过告警的机器
+        // 查找超过 3 分钟未上报心跳，且还未发送过告警的机器
         const { results } = await db.prepare(`SELECT ip, name, last_report FROM servers WHERE last_report < ? AND alert_sent = 0`).bind(nowMs - 180000).all();
         
         if (results && results.length > 0) {
