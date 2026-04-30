@@ -92,9 +92,8 @@ def process_argo_nodes(configs):
             
     return argo_urls_to_report
 
-
 # ===============================================
-# 🌟 核心进化：纯 Python 原生内核抓取模块 (100%兼容所有Linux)
+# 内核抓取模块 (100%兼容所有Linux)
 # ===============================================
 def get_system_status():
     global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx
@@ -104,7 +103,6 @@ def get_system_status():
         "tcp_conn": 0, "udp_conn": 0
     }
     
-    # 1. 纯内核级 CPU 抓取
     try:
         with open('/proc/stat', 'r') as f:
             for line in f:
@@ -122,7 +120,6 @@ def get_system_status():
                     break
     except Exception: pass
 
-    # 2. 纯内核级 内存 抓取
     try:
         with open('/proc/meminfo', 'r') as f:
             mem_data = f.read()
@@ -134,7 +131,6 @@ def get_system_status():
             stats["mem"] = round(((total - avail) / total) * 100, 2)
     except Exception: pass
 
-    # 3. 纯原生 磁盘使用率 抓取 (摆脱 df 命令)
     try:
         st = os.statvfs('/')
         total_disk = st.f_blocks * st.f_frsize
@@ -143,7 +139,6 @@ def get_system_status():
             stats["disk"] = int((used_disk / total_disk) * 100)
     except Exception: pass
 
-    # 4. 纯内核级 运行时长 抓取 (摆脱 uptime -p 报错)
     try:
         with open('/proc/uptime', 'r') as f:
             uptime_seconds = float(f.readline().split()[0])
@@ -153,19 +148,16 @@ def get_system_status():
             stats["uptime"] = f"{days} Day, {hours}:{mins:02d}"
     except Exception: pass
 
-    # 5. 纯内核级 Load 抓取
     try:
         with open('/proc/loadavg', 'r') as f:
             stats["load"] = " ".join(f.readline().split()[:3])
     except Exception: pass
 
-    # 6. 连接数抓取 (保留 ss, 它在所有系统都很稳定)
     try:
         stats["tcp_conn"] = int(os.popen("ss -ant 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
         stats["udp_conn"] = int(os.popen("ss -anu 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
     except Exception: pass
 
-    # 7. 纯内核级 实时网速 抓取 (摆脱 awk 语法报错)
     try:
         rx_now = 0
         tx_now = 0
@@ -173,7 +165,6 @@ def get_system_status():
             lines = f.readlines()[2:]
             for line in lines:
                 parts = line.split()
-                # 排除 loopback 本地回环网卡，只计算真实网卡流量
                 if len(parts) > 10 and not parts[0].startswith('lo'):
                     rx_now += int(parts[1])
                     tx_now += int(parts[9])
@@ -187,7 +178,6 @@ def get_system_status():
     except Exception: pass
 
     return stats
-
 
 # ===============================================
 # 节点流量精准抓取模块
@@ -212,7 +202,6 @@ def get_port_traffic(port, protocol="tcp"):
     except Exception:
         return 0
 
-
 # ===============================================
 # 云端通讯模块
 # ===============================================
@@ -229,7 +218,6 @@ def report_status(current_nodes, argo_urls):
         nid = node["id"]
         port = node["port"]
         current_ids.add(nid)
-        # Hysteria2 和 TUIC 必须抓 UDP 流量
         proto = "udp" if node["protocol"] in ["Hysteria2", "TUIC"] else "tcp"
         
         current_bytes = get_port_traffic(port, proto)
@@ -265,7 +253,6 @@ def fetch_and_apply_configs():
     except Exception:
         pass
     return None
-
 
 # ===============================================
 # Sing-box 全协议底层配置引擎
@@ -306,13 +293,18 @@ def build_singbox_config(nodes):
         elif proto in ["Hysteria2", "TUIC"]:
             cert_path = f"/opt/kui/cert_{node['id']}.pem"
             key_path = f"/opt/kui/key_{node['id']}.pem"
-            sni = node.get("sni", "www.apple.com")
+            
+            # 🌟 修复：强制拦截前端传来的空字符串 ""，并提供有效兜底
+            sni = node.get("sni")
+            if not sni:
+                sni = "www.apple.com"
             
             active_certs.extend([f"cert_{node['id']}.pem", f"key_{node['id']}.pem"])
 
             if not os.path.exists(cert_path) or not os.path.exists(key_path):
-                cmd = f'openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) -keyout {key_path} -out {cert_path} -days 3650 -subj "/O=GlobalSign/CN={sni}" 2>/dev/null'
-                subprocess.run(cmd, shell=True, executable='/bin/bash')
+                # 🌟 修复：改为纯 POSIX 语法的 OpenSSL 命令，摒弃 bash 独有的 <() 语法，完美兼容 Alpine
+                cmd = f'openssl ecparam -genkey -name prime256v1 -out {key_path} && openssl req -new -x509 -nodes -days 3650 -key {key_path} -out {cert_path} -subj "/O=GlobalSign/CN={sni}" 2>/dev/null'
+                subprocess.run(cmd, shell=True)
                 subprocess.run(["chmod", "644", cert_path, key_path])
 
             if proto == "Hysteria2":
@@ -373,7 +365,11 @@ def build_singbox_config(nodes):
     if new_config_str != old_config_str:
         with open(SINGBOX_CONF_PATH, "w") as f:
             f.write(new_config_str)
-        subprocess.run(["systemctl", "restart", "sing-box"])
+        # 🌟 修复：智能识别底层系统类型，动态使用 OpenRC 或 Systemctl 进行重启
+        if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
+            subprocess.run(["rc-service", "sing-box", "restart"])
+        else:
+            subprocess.run(["systemctl", "restart", "sing-box"])
 
 
 # ===============================================
@@ -382,7 +378,6 @@ def build_singbox_config(nodes):
 if __name__ == "__main__":
     current_active_nodes = []
     
-    # 强制进行一次初始配置拉取
     time.sleep(2)
     
     while True:
@@ -393,5 +388,4 @@ if __name__ == "__main__":
         argo_urls = process_argo_nodes(current_active_nodes)
         report_status(current_active_nodes, argo_urls)
         
-        # 60 秒轮询心跳
         time.sleep(60)
