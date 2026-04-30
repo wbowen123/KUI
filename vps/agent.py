@@ -43,7 +43,6 @@ prev_cpu_total = 0
 prev_cpu_idle = 0
 prev_rx = 0
 prev_tx = 0
-prev_net_time = 0
 
 # ===============================================
 # Argo 全自动穿透核心模块
@@ -94,10 +93,10 @@ def process_argo_nodes(configs):
     return argo_urls_to_report
 
 # ===============================================
-# 内核抓取模块 (100%兼容所有Linux) + 精准增量测速
+# 内核抓取模块 (100%兼容所有Linux)
 # ===============================================
 def get_system_status():
-    global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx, prev_net_time
+    global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx
     stats = {
         "cpu": 0, "mem": 0, "disk": 0, "uptime": "Unknown", 
         "load": "0.00 0.00 0.00", "net_in_speed": 0, "net_out_speed": 0, 
@@ -159,7 +158,6 @@ def get_system_status():
         stats["udp_conn"] = int(os.popen("ss -anu 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
     except Exception: pass
 
-    # 🌟 新增：带时间戳因子的精密网速计算 (完美适配快慢双轨变频)
     try:
         rx_now = 0
         tx_now = 0
@@ -171,37 +169,28 @@ def get_system_status():
                     rx_now += int(parts[1])
                     tx_now += int(parts[9])
         
-        now_t = time.time()
-        if prev_rx > 0 and prev_tx > 0 and prev_net_time > 0:
-            delta_t = now_t - prev_net_time
-            if delta_t > 0:
-                stats["net_in_speed"] = int((rx_now - prev_rx) / delta_t)
-                stats["net_out_speed"] = int((tx_now - prev_tx) / delta_t)
+        if prev_rx > 0 and prev_tx > 0:
+            stats["net_in_speed"] = int((rx_now - prev_rx) / 60)
+            stats["net_out_speed"] = int((tx_now - prev_tx) / 60)
         
         prev_rx = rx_now
         prev_tx = tx_now
-        prev_net_time = now_t
     except Exception: pass
 
     return stats
 
 # ===============================================
-# 节点流量精准抓取模块 (增加防火墙规则防抖优化)
+# 节点流量精准抓取模块
 # ===============================================
-checked_ports = set()
-
 def get_port_traffic(port, protocol="tcp"):
-    global checked_ports
     try:
-        if port not in checked_ports:
-            check_in = f"iptables -C INPUT -p {protocol} --dport {port}"
-            if subprocess.run(check_in, shell=True, stderr=subprocess.DEVNULL).returncode != 0:
-                subprocess.run(f"iptables -I INPUT -p {protocol} --dport {port}", shell=True)
+        check_in = f"iptables -C INPUT -p {protocol} --dport {port}"
+        if subprocess.run(check_in, shell=True, stderr=subprocess.DEVNULL).returncode != 0:
+            subprocess.run(f"iptables -I INPUT -p {protocol} --dport {port}", shell=True)
 
-            check_out = f"iptables -C OUTPUT -p {protocol} --sport {port}"
-            if subprocess.run(check_out, shell=True, stderr=subprocess.DEVNULL).returncode != 0:
-                subprocess.run(f"iptables -I OUTPUT -p {protocol} --sport {port}", shell=True)
-            checked_ports.add(port)
+        check_out = f"iptables -C OUTPUT -p {protocol} --sport {port}"
+        if subprocess.run(check_out, shell=True, stderr=subprocess.DEVNULL).returncode != 0:
+            subprocess.run(f"iptables -I OUTPUT -p {protocol} --sport {port}", shell=True)
 
         out_in = subprocess.check_output(f"iptables -nvx -L INPUT | grep 'dpt:{port}'", shell=True).decode()
         in_bytes = sum([int(line.split()[1]) for line in out_in.strip().split('\n') if line])
@@ -248,10 +237,9 @@ def report_status(current_nodes, argo_urls):
 
     req = urllib.request.Request(REPORT_URL, data=json.dumps(status).encode('utf-8'), headers=HEADERS)
     try:
-        res = urllib.request.urlopen(req, timeout=5)
-        return json.loads(res.read().decode('utf-8'))
+        urllib.request.urlopen(req, timeout=5)
     except Exception:
-        return None
+        pass
 
 def fetch_and_apply_configs():
     req = urllib.request.Request(f"{API_URL}?ip={VPS_IP}", headers=HEADERS)
@@ -305,11 +293,16 @@ def build_singbox_config(nodes):
         elif proto in ["Hysteria2", "TUIC"]:
             cert_path = f"/opt/kui/cert_{node['id']}.pem"
             key_path = f"/opt/kui/key_{node['id']}.pem"
-            sni = node.get("sni", "www.apple.com")
+            
+            # 🌟 修复：强制拦截前端传来的空字符串 ""，并提供有效兜底
+            sni = node.get("sni")
+            if not sni:
+                sni = "www.apple.com"
             
             active_certs.extend([f"cert_{node['id']}.pem", f"key_{node['id']}.pem"])
 
             if not os.path.exists(cert_path) or not os.path.exists(key_path):
+                # 🌟 修复：改为纯 POSIX 语法的 OpenSSL 命令，摒弃 bash 独有的 <() 语法，完美兼容 Alpine
                 cmd = f'openssl ecparam -genkey -name prime256v1 -out {key_path} && openssl req -new -x509 -nodes -days 3650 -key {key_path} -out {cert_path} -subj "/O=GlobalSign/CN={sni}" 2>/dev/null'
                 subprocess.run(cmd, shell=True)
                 subprocess.run(["chmod", "644", cert_path, key_path])
@@ -372,48 +365,27 @@ def build_singbox_config(nodes):
     if new_config_str != old_config_str:
         with open(SINGBOX_CONF_PATH, "w") as f:
             f.write(new_config_str)
+        # 🌟 修复：智能识别底层系统类型，动态使用 OpenRC 或 Systemctl 进行重启
         if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
             subprocess.run(["rc-service", "sing-box", "restart"])
         else:
             subprocess.run(["systemctl", "restart", "sing-box"])
 
+
 # ===============================================
-# 🌟 全新极速主循环引擎 (Fast-Mode)
+# 主循环守护进程
 # ===============================================
 if __name__ == "__main__":
     current_active_nodes = []
     
-    last_config_fetch = 0
-    last_report_time = 0
-    fast_mode = False
-    
-    # 强制进行一次初始抓取
-    time.sleep(1)
+    time.sleep(2)
     
     while True:
-        now = time.time()
-
-        # 1. 独立时钟：拉取配置固定为 60s (省流防拥堵)
-        if now - last_config_fetch >= 60:
-            fetched_nodes = fetch_and_apply_configs()
-            if fetched_nodes is not None:
-                current_active_nodes = fetched_nodes
-            last_config_fetch = now
-
-        # 2. 独立时钟：探针上报极速变频 (有人看就是2s，没人看就是15s)
-        target_interval = 2 if fast_mode else 15
-        
-        if now - last_report_time >= target_interval:
-            argo_urls = process_argo_nodes(current_active_nodes)
-            res_json = report_status(current_active_nodes, argo_urls)
+        fetched_nodes = fetch_and_apply_configs()
+        if fetched_nodes is not None:
+            current_active_nodes = fetched_nodes
             
-            # 解析云端发来的“管理员在看”信号
-            if res_json and isinstance(res_json, dict) and res_json.get("fast_mode"):
-                fast_mode = True
-            else:
-                fast_mode = False
-                
-            last_report_time = time.time()
+        argo_urls = process_argo_nodes(current_active_nodes)
+        report_status(current_active_nodes, argo_urls)
         
-        # 内核睡眠时钟：1秒，保证时序精准切变
-        time.sleep(1)
+        time.sleep(60)
