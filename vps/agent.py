@@ -266,7 +266,7 @@ def fetch_and_apply_configs():
     return None
 
 # ===============================================
-# Sing-box 全协议底层配置引擎
+# Sing-box 全协议底层配置引擎 (已修复严重防呆错误)
 # ===============================================
 def build_singbox_config(nodes):
     singbox_config = {
@@ -285,18 +285,18 @@ def build_singbox_config(nodes):
         if proto == "VLESS":
             singbox_config["inbounds"].append({
                 "type": "vless", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                # 🌟 修复：补全 name 字段
-                "users": [{"name": node["uuid"], "uuid": node["uuid"]}]
+                # 已回滚至稳定版：严格去掉不兼容的 name 字段
+                "users": [{"uuid": node["uuid"]}]
             })
             
         elif proto == "Reality":
             singbox_config["inbounds"].append({
                 "type": "vless", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                # 🌟 修复：补全 name 字段
-                "users": [{"name": node["uuid"], "uuid": node["uuid"], "flow": "xtls-rprx-vision"}],
+                "users": [{"uuid": node["uuid"], "flow": "xtls-rprx-vision"}],
                 "tls": {
                     "enabled": True,
-                    # 🌟 核心修复：移除死板的 server_name 强校验，避免阻断客户端握手
+                    # 🌟 已回滚：此处必须有 server_name，否则 sing-box 直接抛错崩溃
+                    "server_name": node["sni"],
                     "reality": {
                         "enabled": True, "handshake": {"server": node["sni"], "server_port": 443},
                         "private_key": node["private_key"], "short_id": [node["short_id"]]
@@ -319,30 +319,30 @@ def build_singbox_config(nodes):
             if proto == "Hysteria2":
                 singbox_config["inbounds"].append({
                     "type": "hysteria2", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                    # 🌟 修复：补全 name 字段
-                    "users": [{"name": node["uuid"], "password": node["uuid"]}],
+                    "users": [{"password": node["uuid"]}],
                     "tls": { "enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path }
                 })
             elif proto == "TUIC":
                 singbox_config["inbounds"].append({
                     "type": "tuic", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                    # 🌟 修复：补全 name 字段
-                    "users": [{"name": node["uuid"], "uuid": node["uuid"], "password": node["private_key"]}],
+                    "users": [{"uuid": node["uuid"], "password": node["private_key"]}],
                     "tls": { "enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path }
                 })
 
+        # 🌟 完美嵌入：SS2022 代理底层支持
         elif proto == "SS2022":
+            method = node.get("sni", "2022-blake3-aes-128-gcm")
+            if not method: method = "2022-blake3-aes-128-gcm"
             singbox_config["inbounds"].append({
                 "type": "shadowsocks", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                "method": node.get("sni", "2022-blake3-aes-128-gcm"),
+                "method": method,
                 "password": node["private_key"]
             })
 
         elif proto == "VLESS-Argo":
             singbox_config["inbounds"].append({
                 "type": "vless", "tag": in_tag, "listen": "127.0.0.1", "listen_port": int(node["port"]),
-                # 🌟 修复：补全 name 字段
-                "users": [{"name": node["uuid"], "uuid": node["uuid"]}],
+                "users": [{"uuid": node["uuid"]}],
                 "transport": {"type": "ws", "path": "/"}
             })
             
