@@ -1,6 +1,6 @@
 // ==========================================
-// KUI Serverless 聚合网关后端 - 零配置全自动建表完全体
-// (包含：系统重命名 + 独立订阅 Token 解耦 + 心跳引擎)
+// KUI Serverless 聚合网关后端 - 终极完整版
+// (包含：自动建表 + 极速8合1协议生成 + 智能心跳引擎 + TG告警)
 // ==========================================
 
 async function sha256(text) {
@@ -8,7 +8,7 @@ async function sha256(text) {
     return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 🌟 终极进化：全自动生成表结构与索引，无缝兼容老版本热升级
+// 🌟 全自动生成表结构与索引，无缝兼容老版本热升级
 async function ensureDbSchema(db) {
     const initQueries = [
         `CREATE TABLE IF NOT EXISTS servers (
@@ -65,7 +65,7 @@ async function ensureDbSchema(db) {
         )`,
         `CREATE INDEX IF NOT EXISTS idx_traffic_ip_time ON traffic_stats(ip, timestamp)`,
         
-        // 🌟 新增：系统配置表，用于记录前端面板的活跃心跳与全局设置
+        // 记录前端面板的活跃心跳与全局设置
         `CREATE TABLE IF NOT EXISTS sys_config (
             key TEXT PRIMARY KEY, 
             val TEXT, 
@@ -212,7 +212,7 @@ export async function onRequest(context) {
         
         if (stmts.length > 0) await db.batch(stmts);
 
-        // 🌟 将心跳检测结果传回探针，决定探针下一秒是否挂入“极速2秒挡”
+        // 🌟 将心跳检测结果传回探针，决定探针下一秒是否挂入“极速模式”
         let fastMode = false;
         try {
             const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first();
@@ -261,7 +261,7 @@ export async function onRequest(context) {
         return Response.json({ success: true, configs: machineNodes });
     }
 
-    // 全量聚合订阅接口 (动态拼接全协议)
+    // 🌟 全量聚合订阅接口 (已剔除 ShadowTLS 等无效协议)
     if (action === "sub" && method === "GET") {
         const ip = url.searchParams.get("ip");
         const reqUser = url.searchParams.get("user");
@@ -270,19 +270,17 @@ export async function onRequest(context) {
 
         let isValid = false;
         
-        // 🌟 订阅令牌解耦验证
+        // 订阅令牌解耦验证
         if (reqUser === adminUser) {
             let adminSubToken = await sha256(env.ADMIN_PASSWORD || "admin");
             try { 
                 const r = await db.prepare("SELECT val FROM sys_config WHERE key='admin_sub_token'").first(); 
                 if(r && r.val) adminSubToken = r.val; 
             } catch(e){}
-            // 管理员同时允许使用原密码 Hash 或新的 sub_token
             isValid = (token === adminSubToken) || (token === await sha256(env.ADMIN_PASSWORD || "admin"));
         } else {
             const u = await db.prepare("SELECT password, sub_token FROM users WHERE username = ?").bind(reqUser).first();
             if (u) {
-                // 如果有独立的 sub_token，则必须匹配；否则兼容老的密码登录
                 isValid = (token === u.sub_token) || (!u.sub_token && token === u.password);
             }
         }
@@ -311,25 +309,55 @@ export async function onRequest(context) {
 
         const { results } = await db.prepare(query).bind(...sqlParams).all();
         let subLinks = [];
-        
+
         for (let node of results) {
             const vpsInfo = await db.prepare("SELECT name FROM servers WHERE ip = ?").bind(node.vps_ip).first();
-            const remark = encodeURIComponent(`${vpsInfo ? vpsInfo.name : 'KUI'} | ${node.protocol}_${node.port}`);
+            const rawRemark = `${vpsInfo ? vpsInfo.name : 'KUI'} | ${node.protocol}_${node.port}`;
+            const remark = encodeURIComponent(rawRemark);
             
-            if (node.protocol === "VLESS") {
-                subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&security=none&type=tcp#${remark}`);
-            } else if (node.protocol === "Reality") {
-                subLinks.push(`vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${node.sni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id}&type=tcp&headerType=none#${remark}-Reality`);
-            } else if (node.protocol === "Hysteria2") {
-                subLinks.push(`hysteria2://${node.uuid}@${node.vps_ip}:${node.port}/?insecure=1&sni=${node.sni}#${remark}-Hy2`);
-            } else if (node.protocol === "TUIC") {
-                subLinks.push(`tuic://${node.uuid}:${node.private_key}@${node.vps_ip}:${node.port}?sni=${node.sni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${remark}-TUIC`);
-            } else if (node.protocol === "Socks5") {
-                const auth = btoa(`${node.uuid}:${node.private_key}`);
-                subLinks.push(`socks5://${auth}@${node.vps_ip}:${node.port}#${remark}-Socks5`);
-            } else if (node.protocol === "VLESS-Argo" && !node.sni.includes('等待')) {
-                subLinks.push(`vless://${node.uuid}@${node.sni}:443?encryption=none&security=tls&type=ws&host=${node.sni}&path=%2F#${remark}-Argo`);
+            let link = "";
+
+            // 彻底剔除了 ShadowTLS
+            switch (node.protocol) {
+                case "VLESS":
+                    link = `vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&security=none&type=tcp#${remark}`;
+                    break;
+                case "XTLS-Reality":
+                case "Reality": // 兼容旧标识
+                    link = `vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${node.sni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=tcp&headerType=none#${remark}`;
+                    break;
+                case "Hysteria2":
+                    link = `hysteria2://${node.uuid}@${node.vps_ip}:${node.port}/?insecure=1&sni=${node.sni}&alpn=h3#${remark}`;
+                    break;
+                case "TUIC":
+                    link = `tuic://${node.uuid}:${node.private_key}@${node.vps_ip}:${node.port}?sni=${node.sni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${remark}`;
+                    break;
+                case "Trojan":
+                    link = `trojan://${node.private_key}@${node.vps_ip}:${node.port}?security=tls&sni=${node.sni}&allowInsecure=1&type=tcp#${remark}`;
+                    break;
+                case "H2-Reality":
+                    link = `vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&security=reality&sni=${node.sni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=http#${remark}`;
+                    break;
+                case "gRPC-Reality":
+                    link = `vless://${node.uuid}@${node.vps_ip}:${node.port}?encryption=none&security=reality&sni=${node.sni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=grpc&serviceName=grpc#${remark}`;
+                    break;
+                case "AnyTLS":
+                    link = `anytls://${node.private_key}@${node.vps_ip}:${node.port}?security=tls&sni=${node.sni}&insecure=1#${remark}`;
+                    break;
+                case "Naive":
+                    link = `naive+https://${node.uuid}:${node.private_key}@${node.vps_ip}:${node.port}?security=tls&sni=${node.sni}#${remark}`;
+                    break;
+                case "Socks5":
+                    const s5Auth = btoa(`${node.uuid}:${node.private_key}`);
+                    link = `socks5://${s5Auth}@${node.vps_ip}:${node.port}#${remark}`;
+                    break;
+                case "VLESS-Argo":
+                    if (!node.sni.includes('等待')) {
+                        link = `vless://${node.uuid}@${node.sni}:443?encryption=none&security=tls&type=ws&host=${node.sni}&path=%2F#${remark}-Argo`;
+                    }
+                    break;
             }
+            if (link) subLinks.push(link);
         }
 
         return new Response(btoa(unescape(encodeURIComponent(subLinks.join('\n')))), { headers: { "Content-Type": "text/plain; charset=utf-8" }});
@@ -381,14 +409,14 @@ export async function onRequest(context) {
             return Response.json({ servers, nodes, users, siteTitle, mySubToken });
         }
         
-        // 🌟 [POST] 管理员修改全局系统名称
+        // [POST] 管理员修改全局系统名称
         if (action === "settings" && method === "POST" && isAdmin) {
             const { site_title } = await request.json();
             await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('site_title', ?, ?)").bind(site_title, Date.now()).run();
             return Response.json({ success: true });
         }
 
-        // 🌟 [PUT] 普通用户修改个人密码
+        // [PUT] 普通用户修改个人密码
         if (action === "user" && params.path[1] === "password" && method === "PUT") {
             const { password } = await request.json();
             if (isAdmin) {
@@ -399,7 +427,7 @@ export async function onRequest(context) {
             return Response.json({ success: true });
         }
 
-        // 🌟 [PUT] 系统重置订阅独立 Token
+        // [PUT] 系统重置订阅独立 Token
         if (action === "user" && params.path[1] === "sub_token" && method === "PUT") {
             const newToken = crypto.randomUUID();
             if (isAdmin) {
@@ -503,7 +531,7 @@ export async function onRequestScheduled(context) {
     const nowMs = Date.now();
     
     try {
-        // 查找超过 3 分钟 (180000ms) 未上报心跳，且还未发送过告警的机器
+        // 查找超过 3 分钟未上报心跳，且还未发送过告警的机器
         const { results } = await db.prepare(`SELECT ip, name, last_report FROM servers WHERE last_report < ? AND alert_sent = 0`).bind(nowMs - 180000).all();
         
         if (results && results.length > 0) {

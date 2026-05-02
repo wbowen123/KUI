@@ -7,14 +7,10 @@ import subprocess
 import re
 import sys
 
-# ===============================================
 # 强制系统编码锁
-# ===============================================
 if sys.stdout.encoding != 'UTF-8':
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
+    try: sys.stdout.reconfigure(encoding='utf-8')
+    except Exception: pass
 
 CONF_FILE = "/opt/kui/config.json"
 SINGBOX_CONF_PATH = "/etc/sing-box/config.json"
@@ -31,243 +27,132 @@ REPORT_URL = env["report_url"]
 VPS_IP = env["ip"]
 TOKEN = env["token"]
 
-HEADERS = {
-    'Content-Type': 'application/json',
-    'Authorization': TOKEN,
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-}
-
+HEADERS = {'Content-Type': 'application/json', 'Authorization': TOKEN, 'User-Agent': 'KUI-Agent/1.3.10'}
 last_reported_bytes = {}
 argo_tunnels = {}
-prev_cpu_total = 0
-prev_cpu_idle = 0
-prev_rx = 0
-prev_tx = 0
-prev_net_time = 0
+prev_cpu_total = prev_cpu_idle = prev_rx = prev_tx = 0
 
 # ===============================================
-# Argo 全自动穿透核心模块
+# 🚀 防火墙无死角智能击穿
 # ===============================================
-def ensure_cloudflared():
-    if not os.path.exists("/usr/local/bin/cloudflared"):
-        print("First Argo node detected. Installing cloudflared silently...")
-        os.system("curl -L -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64")
-        os.system("chmod +x /usr/local/bin/cloudflared")
+def ensure_firewall_open(port):
+    port = str(port)
+    for protocol in ["tcp", "udp"]:
+        cmds = [
+            f"iptables -C INPUT -p {protocol} --dport {port} -j ACCEPT 2>/dev/null || iptables -I INPUT -p {protocol} --dport {port} -j ACCEPT",
+            f"iptables -C OUTPUT -p {protocol} --sport {port} -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p {protocol} --sport {port} -j ACCEPT",
+            f"ip6tables -C INPUT -p {protocol} --dport {port} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p {protocol} --dport {port} -j ACCEPT",
+            f"ip6tables -C OUTPUT -p {protocol} --sport {port} -j ACCEPT 2>/dev/null || ip6tables -I OUTPUT -p {protocol} --sport {port} -j ACCEPT"
+        ]
+        for cmd in cmds: subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL)
 
-def start_argo_tunnel(port):
-    ensure_cloudflared()
-    cmd = ["/usr/local/bin/cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"]
-    p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
-    
-    url = None
-    start_time = time.time()
-    while time.time() - start_time < 15:
-        line = p.stderr.readline()
-        if not line: break
-        match = re.search(r'https://([a-zA-Z0-9-]+\.trycloudflare\.com)', line)
-        if match:
-            url = match.group(1)
-            break
-    return p, url
+        if subprocess.run("command -v ufw", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            subprocess.run(f"ufw allow {port}/{protocol} >/dev/null 2>&1", shell=True)
 
-def process_argo_nodes(configs):
-    argo_urls_to_report = []
-    expected_argo_ports = []
-    
-    for node in configs:
-        if node.get('protocol') == 'VLESS-Argo':
-            port = str(node['port'])
-            expected_argo_ports.append(port)
-            if port not in argo_tunnels:
-                p, url = start_argo_tunnel(port)
-                if url:
-                    argo_tunnels[port] = {"proc": p, "url": url}
-                    argo_urls_to_report.append({"id": node["id"], "url": url})
-            else:
-                argo_urls_to_report.append({"id": node["id"], "url": argo_tunnels[port]["url"]})
-                
-    for port in list(argo_tunnels.keys()):
-        if port not in expected_argo_ports:
-            argo_tunnels[port]["proc"].terminate()
-            del argo_tunnels[port]
-            
-    return argo_urls_to_report
+        if subprocess.run("command -v firewall-cmd", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            subprocess.run(f"firewall-cmd --zone=public --add-port={port}/{protocol} >/dev/null 2>&1", shell=True)
+
+def get_port_traffic(port, protocol="tcp"):
+    ensure_firewall_open(port)
+    try:
+        in_bytes = out_bytes = 0
+        out_in = subprocess.check_output(f"iptables -nvx -L INPUT | grep 'dpt:{port}'", shell=True).decode()
+        in_bytes += sum([int(line.split()[1]) for line in out_in.strip().split('\n') if line])
+        out_out = subprocess.check_output(f"iptables -nvx -L OUTPUT | grep 'spt:{port}'", shell=True).decode()
+        out_bytes += sum([int(line.split()[1]) for line in out_out.strip().split('\n') if line])
+        try:
+            out_in6 = subprocess.check_output(f"ip6tables -nvx -L INPUT | grep 'dpt:{port}'", shell=True).decode()
+            in_bytes += sum([int(line.split()[1]) for line in out_in6.strip().split('\n') if line])
+            out_out6 = subprocess.check_output(f"ip6tables -nvx -L OUTPUT | grep 'spt:{port}'", shell=True).decode()
+            out_bytes += sum([int(line.split()[1]) for line in out_out6.strip().split('\n') if line])
+        except Exception: pass
+        return in_bytes + out_bytes
+    except Exception: return 0
 
 # ===============================================
-# 内核抓取模块 (100%兼容所有Linux) + 精准增量测速
+# 核心状态采集与上报
 # ===============================================
 def get_system_status():
-    global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx, prev_net_time
-    stats = {
-        "cpu": 0, "mem": 0, "disk": 0, "uptime": "Unknown", 
-        "load": "0.00 0.00 0.00", "net_in_speed": 0, "net_out_speed": 0, 
-        "tcp_conn": 0, "udp_conn": 0
-    }
-    
+    global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx
+    stats = {"cpu": 0, "mem": 0, "disk": 0, "uptime": "Unknown", "load": "0.00", "net_in_speed": 0, "net_out_speed": 0}
     try:
         with open('/proc/stat', 'r') as f:
             for line in f:
                 if line.startswith('cpu '):
-                    parts = [float(p) for p in line.split()[1:]]
-                    idle = parts[3] + parts[4]
-                    total = sum(parts)
-                    if prev_cpu_total > 0:
-                        diff_total = total - prev_cpu_total
-                        diff_idle = idle - prev_cpu_idle
-                        if diff_total > 0:
-                            stats["cpu"] = int(100.0 * (1.0 - diff_idle / diff_total))
-                    prev_cpu_total = total
-                    prev_cpu_idle = idle
+                    p = [float(x) for x in line.split()[1:]]
+                    idle, total = p[3] + p[4], sum(p)
+                    if prev_cpu_total > 0 and (total - prev_cpu_total) > 0:
+                        stats["cpu"] = int(100.0 * (1.0 - (idle - prev_cpu_idle) / (total - prev_cpu_total)))
+                    prev_cpu_total, prev_cpu_idle = total, idle
                     break
     except Exception: pass
-
     try:
-        with open('/proc/meminfo', 'r') as f:
-            mem_data = f.read()
-        total_match = re.search(r'MemTotal:\s+(\d+)', mem_data)
-        avail_match = re.search(r'MemAvailable:\s+(\d+)', mem_data)
-        if total_match and avail_match:
-            total = float(total_match.group(1))
-            avail = float(avail_match.group(1))
-            stats["mem"] = round(((total - avail) / total) * 100, 2)
+        with open('/proc/meminfo', 'r') as f: mem = f.read()
+        t = re.search(r'MemTotal:\s+(\d+)', mem)
+        a = re.search(r'MemAvailable:\s+(\d+)', mem)
+        if t and a: stats["mem"] = int(((float(t.group(1)) - float(a.group(1))) / float(t.group(1))) * 100)
     except Exception: pass
-
-    try:
-        st = os.statvfs('/')
-        total_disk = st.f_blocks * st.f_frsize
-        used_disk = (st.f_blocks - st.f_bfree) * st.f_frsize
-        if total_disk > 0:
-            stats["disk"] = int((used_disk / total_disk) * 100)
-    except Exception: pass
-
-    try:
-        with open('/proc/uptime', 'r') as f:
-            uptime_seconds = float(f.readline().split()[0])
-            days = int(uptime_seconds // 86400)
-            hours = int((uptime_seconds % 86400) // 3600)
-            mins = int((uptime_seconds % 3600) // 60)
-            stats["uptime"] = f"{days} Day, {hours}:{mins:02d}"
-    except Exception: pass
-
-    try:
-        with open('/proc/loadavg', 'r') as f:
-            stats["load"] = " ".join(f.readline().split()[:3])
-    except Exception: pass
-
-    try:
-        stats["tcp_conn"] = int(os.popen("ss -ant 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
-        stats["udp_conn"] = int(os.popen("ss -anu 2>/dev/null | grep -v State | wc -l").read().strip() or 0)
-    except Exception: pass
-
-    # 🌟 新增：带时间戳因子的精密网速计算 (完美适配快慢双轨变频)
-    try:
-        rx_now = 0
-        tx_now = 0
-        with open('/proc/net/dev', 'r') as f:
-            lines = f.readlines()[2:]
-            for line in lines:
-                parts = line.split()
-                if len(parts) > 10 and not parts[0].startswith('lo'):
-                    rx_now += int(parts[1])
-                    tx_now += int(parts[9])
-        
-        now_t = time.time()
-        if prev_rx > 0 and prev_tx > 0 and prev_net_time > 0:
-            delta_t = now_t - prev_net_time
-            if delta_t > 0:
-                stats["net_in_speed"] = int((rx_now - prev_rx) / delta_t)
-                stats["net_out_speed"] = int((tx_now - prev_tx) / delta_t)
-        
-        prev_rx = rx_now
-        prev_tx = tx_now
-        prev_net_time = now_t
-    except Exception: pass
-
     return stats
 
-# ===============================================
-# 节点流量精准抓取模块 (增加防火墙规则防抖优化)
-# ===============================================
-checked_ports = set()
-
-def get_port_traffic(port, protocol="tcp"):
-    global checked_ports
-    try:
-        if port not in checked_ports:
-            check_in = f"iptables -C INPUT -p {protocol} --dport {port}"
-            if subprocess.run(check_in, shell=True, stderr=subprocess.DEVNULL).returncode != 0:
-                subprocess.run(f"iptables -I INPUT -p {protocol} --dport {port}", shell=True)
-
-            check_out = f"iptables -C OUTPUT -p {protocol} --sport {port}"
-            if subprocess.run(check_out, shell=True, stderr=subprocess.DEVNULL).returncode != 0:
-                subprocess.run(f"iptables -I OUTPUT -p {protocol} --sport {port}", shell=True)
-            checked_ports.add(port)
-
-        out_in = subprocess.check_output(f"iptables -nvx -L INPUT | grep 'dpt:{port}'", shell=True).decode()
-        in_bytes = sum([int(line.split()[1]) for line in out_in.strip().split('\n') if line])
-
-        out_out = subprocess.check_output(f"iptables -nvx -L OUTPUT | grep 'spt:{port}'", shell=True).decode()
-        out_bytes = sum([int(line.split()[1]) for line in out_out.strip().split('\n') if line])
-
-        return in_bytes + out_bytes
-    except Exception:
-        return 0
-
-# ===============================================
-# 云端通讯模块
-# ===============================================
 def report_status(current_nodes, argo_urls):
     global last_reported_bytes
     status = get_system_status()
     status["ip"] = VPS_IP
     status["argo_urls"] = argo_urls
-    
-    node_traffic_deltas = []
+    deltas = []
     current_ids = set()
 
     for node in current_nodes:
-        nid = node["id"]
-        port = node["port"]
+        nid, port = node["id"], node["port"]
         current_ids.add(nid)
         proto = "udp" if node["protocol"] in ["Hysteria2", "TUIC"] else "tcp"
-        
         current_bytes = get_port_traffic(port, proto)
-        last_bytes = last_reported_bytes.get(nid, 0)
         
-        delta = current_bytes - last_bytes
-        if delta < 0: delta = current_bytes
-        if delta > 0: node_traffic_deltas.append({ "id": nid, "delta_bytes": delta })
-        
+        delta = current_bytes - last_reported_bytes.get(nid, current_bytes)
+        if delta > 0: deltas.append({ "id": nid, "delta_bytes": delta })
         last_reported_bytes[nid] = current_bytes
 
-    for old_id in list(last_reported_bytes.keys()):
-        if old_id not in current_ids:
-            del last_reported_bytes[old_id]
+    last_reported_bytes = {k: v for k, v in last_reported_bytes.items() if k in current_ids}
+    status["node_traffic"] = deltas
 
-    status["node_traffic"] = node_traffic_deltas
-
-    req = urllib.request.Request(REPORT_URL, data=json.dumps(status).encode('utf-8'), headers=HEADERS)
-    try:
-        res = urllib.request.urlopen(req, timeout=5)
-        return json.loads(res.read().decode('utf-8'))
-    except Exception:
-        return None
-
-def fetch_and_apply_configs():
-    req = urllib.request.Request(f"{API_URL}?ip={VPS_IP}", headers=HEADERS)
-    try:
-        res = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(res.read().decode('utf-8'))
-        if data.get("success"):
-            nodes = data.get("configs", [])
-            build_singbox_config(nodes)
-            return nodes
-    except Exception:
-        pass
-    return None
+    try: urllib.request.urlopen(urllib.request.Request(REPORT_URL, data=json.dumps(status).encode(), headers=HEADERS), timeout=5)
+    except Exception: pass
 
 # ===============================================
-# Sing-box 全协议底层配置引擎
+# Argo 隧道高可用守护
+# ===============================================
+def ensure_cloudflared():
+    if not os.path.exists("/usr/local/bin/cloudflared"):
+        os.system("curl -L -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x /usr/local/bin/cloudflared")
+
+def process_argo_nodes(configs):
+    argo_urls = []
+    expected_ports = [str(n['port']) for n in configs if n.get('protocol') == 'VLESS-Argo']
+    
+    for port in expected_ports:
+        if port not in argo_tunnels:
+            ensure_cloudflared()
+            cmd = ["/usr/local/bin/cloudflared", "tunnel", "--edge-ip-version", "auto", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"]
+            p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+            url = None
+            start_t = time.time()
+            while time.time() - start_t < 15:
+                line = p.stderr.readline()
+                if not line: break
+                m = re.search(r'https://([a-zA-Z0-9-]+\.trycloudflare\.com)', line)
+                if m: url = m.group(1); break
+            if url: argo_tunnels[port] = {"proc": p, "url": url}
+        if port in argo_tunnels: argo_urls.append({"id": [n['id'] for n in configs if str(n['port'])==port][0], "url": argo_tunnels[port]["url"]})
+            
+    for port in list(argo_tunnels.keys()):
+        if port not in expected_ports:
+            argo_tunnels[port]["proc"].terminate()
+            del argo_tunnels[port]
+            
+    return argo_urls
+
+# ===============================================
+# 🚀 满血版：支持 FSCARMEN 12大核心协议的 Sing-box 编译引擎
 # ===============================================
 def build_singbox_config(nodes):
     singbox_config = {
@@ -276,144 +161,146 @@ def build_singbox_config(nodes):
         "outbounds": [{"type": "direct", "tag": "direct-out"}],
         "route": {"rules": []}
     }
-
     active_certs = []
 
     for node in nodes:
-        in_tag = f"in-{node['id']}"
-        proto = node["protocol"]
+        in_tag, proto, port = f"in-{node['id']}", node["protocol"], int(node["port"])
+        sni = node.get("sni") or "addons.mozilla.org"
+        clean_uuid = node['uuid'].replace('-', '')
         
-        if proto == "VLESS":
-            singbox_config["inbounds"].append({
-                "type": "vless", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                "users": [{"uuid": node["uuid"]}]
-            })
-            
-        elif proto == "Reality":
-            singbox_config["inbounds"].append({
-                "type": "vless", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                "users": [{"uuid": node["uuid"], "flow": "xtls-rprx-vision"}],
-                "tls": {
-                    "enabled": True, "server_name": node["sni"],
-                    "reality": {
-                        "enabled": True, "handshake": {"server": node["sni"], "server_port": 443},
-                        "private_key": node["private_key"], "short_id": [node["short_id"]]
-                    }
-                }
-            })
-
-        elif proto in ["Hysteria2", "TUIC"]:
-            cert_path = f"/opt/kui/cert_{node['id']}.pem"
-            key_path = f"/opt/kui/key_{node['id']}.pem"
-            sni = node.get("sni", "www.apple.com")
-            
+        # 针对需要 TLS 的协议生成证书
+        if proto in ["Hysteria2", "TUIC", "Trojan", "VLESS-WS-TLS", "AnyTLS", "Naive"]:
+            cert_path, key_path = f"/opt/kui/cert_{node['id']}.pem", f"/opt/kui/key_{node['id']}.pem"
             active_certs.extend([f"cert_{node['id']}.pem", f"key_{node['id']}.pem"])
-
-            if not os.path.exists(cert_path) or not os.path.exists(key_path):
-                cmd = f'openssl ecparam -genkey -name prime256v1 -out {key_path} && openssl req -new -x509 -nodes -days 3650 -key {key_path} -out {cert_path} -subj "/O=GlobalSign/CN={sni}" 2>/dev/null'
-                subprocess.run(cmd, shell=True)
-                subprocess.run(["chmod", "644", cert_path, key_path])
-
-            if proto == "Hysteria2":
-                singbox_config["inbounds"].append({
-                    "type": "hysteria2", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                    "users": [{"password": node["uuid"]}],
-                    "tls": { "enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path }
-                })
-            elif proto == "TUIC":
-                singbox_config["inbounds"].append({
-                    "type": "tuic", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                    "users": [{"uuid": node["uuid"], "password": node["private_key"]}],
-                    "tls": { "enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path }
-                })
-
-        elif proto == "VLESS-Argo":
-            singbox_config["inbounds"].append({
-                "type": "vless", "tag": in_tag, "listen": "127.0.0.1", "listen_port": int(node["port"]),
-                "users": [{"uuid": node["uuid"]}],
-                "transport": {"type": "ws", "path": "/"}
-            })
             
+            if not os.path.exists(cert_path):
+                parts = sni.split('.')
+                cn = f"{parts[-2]}.{parts[-1]}" if len(parts) >= 2 else sni
+                conf_path = f"/opt/kui/cert_{node['id']}.conf"
+                conf_content = f"[req]\ndistinguished_name = req_distinguished_name\nx509_extensions = v3_req\nprompt = no\n[req_distinguished_name]\nCN = {cn}\n[v3_req]\nsubjectAltName = @alt_names\n[alt_names]\nDNS = {sni}\n"
+                with open(conf_path, "w") as f: f.write(conf_content)
+                os.system(f"openssl ecparam -genkey -name prime256v1 -out {key_path} >/dev/null 2>&1")
+                os.system(f"openssl req -new -x509 -days 36500 -key {key_path} -out {cert_path} -config {conf_path} -extensions v3_req >/dev/null 2>&1")
+                os.system(f"chmod 644 {cert_path} {key_path}")
+                try: os.remove(conf_path)
+                except: pass
+        
+        # 1. VLESS (基础直连)
+        if proto == "VLESS":
+            singbox_config["inbounds"].append({"type": "vless", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"uuid": node["uuid"]}]})
+        
+        # 2. XTLS-Reality / Reality
+        elif proto in ["XTLS-Reality", "Reality"]:
+            singbox_config["inbounds"].append({
+                "type": "vless", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"uuid": node["uuid"], "flow": "xtls-rprx-vision"}],
+                "tls": {"enabled": True, "server_name": sni, "reality": {"enabled": True, "handshake": {"server": sni, "server_port": 443}, "private_key": node["private_key"], "short_id": [node["short_id"]]}}
+            })
+        
+        # 3. Hysteria2
+        elif proto == "Hysteria2":
+            singbox_config["inbounds"].append({"type": "hysteria2", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"password": node["uuid"]}], "tls": {"enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path}})
+        
+        # 4. TUIC
+        elif proto == "TUIC":
+            singbox_config["inbounds"].append({"type": "tuic", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"uuid": node["uuid"], "password": node["private_key"]}], "tls": {"enabled": True, "alpn": ["h3"], "certificate_path": cert_path, "key_path": key_path}})
+        
+        # 5. ShadowTLS (复合协议)
+        elif proto == "ShadowTLS":
+            singbox_config["inbounds"].extend([
+                {"type": "shadowtls", "tag": in_tag, "listen": "::", "listen_port": port, "version": 3, "users": [{"password": node["private_key"]}], "handshake": {"server": sni, "server_port": 443}, "strict_mode": True, "detour": f"ss-in-{node['id']}"},
+                {"type": "shadowsocks", "tag": f"ss-in-{node['id']}", "listen": "127.0.0.1", "network": "tcp", "method": "2022-blake3-aes-128-gcm", "password": node["private_key"]}
+            ])
+        
+        # 6. Shadowsocks (2022)
+        elif proto == "Shadowsocks":
+            singbox_config["inbounds"].append({"type": "shadowsocks", "tag": in_tag, "listen": "::", "listen_port": port, "method": "2022-blake3-aes-128-gcm", "password": node["private_key"]})
+            
+        # 7. Trojan
+        elif proto == "Trojan":
+            singbox_config["inbounds"].append({"type": "trojan", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"password": node["private_key"]}], "tls": {"enabled": True, "server_name": sni, "certificate_path": cert_path, "key_path": key_path}})
+            
+        # 8. VMess-WS
+        elif proto == "VMess-WS":
+            path = f"/{clean_uuid}-vmess"
+            singbox_config["inbounds"].append({"type": "vmess", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"uuid": node["uuid"], "alterId": 0}], "transport": {"type": "ws", "path": path, "headers": {"Host": sni}}})
+            
+        # 9. VLESS-WS-TLS
+        elif proto == "VLESS-WS-TLS":
+            path = f"/{clean_uuid}-vless"
+            singbox_config["inbounds"].append({"type": "vless", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"uuid": node["uuid"]}], "tls": {"enabled": True, "server_name": sni, "certificate_path": cert_path, "key_path": key_path}, "transport": {"type": "ws", "path": path, "headers": {"Host": sni}}})
+            
+        # 10. H2-Reality
+        elif proto == "H2-Reality":
+            singbox_config["inbounds"].append({"type": "vless", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"uuid": node["uuid"]}], "tls": {"enabled": True, "server_name": sni, "reality": {"enabled": True, "handshake": {"server": sni, "server_port": 443}, "private_key": node["private_key"], "short_id": [node["short_id"]]}}, "transport": {"type": "http"}})
+            
+        # 11. gRPC-Reality
+        elif proto == "gRPC-Reality":
+            singbox_config["inbounds"].append({"type": "vless", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"uuid": node["uuid"]}], "tls": {"enabled": True, "server_name": sni, "reality": {"enabled": True, "handshake": {"server": sni, "server_port": 443}, "private_key": node["private_key"], "short_id": [node["short_id"]]}}, "transport": {"type": "grpc", "service_name": "grpc"}})
+            
+        # 12. AnyTLS
+        elif proto == "AnyTLS":
+            singbox_config["inbounds"].append({"type": "anytls", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"password": node["private_key"]}], "tls": {"enabled": True, "certificate_path": cert_path, "key_path": key_path}})
+            
+        # 13. Naive
+        elif proto == "Naive":
+            singbox_config["inbounds"].append({"type": "naive", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"username": node["uuid"], "password": node["private_key"]}], "tls": {"enabled": True, "certificate_path": cert_path, "key_path": key_path}})
+
+        # 14. Socks5
         elif proto == "Socks5":
-            singbox_config["inbounds"].append({
-                "type": "socks", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]),
-                "users": [{"username": node["uuid"], "password": node["private_key"]}]
-            })
-            
+            singbox_config["inbounds"].append({"type": "socks", "tag": in_tag, "listen": "::", "listen_port": port, "users": [{"username": node["uuid"], "password": node["private_key"]}]})
+
+        # 15. VLESS-Argo (专属通道)
+        elif proto == "VLESS-Argo":
+            singbox_config["inbounds"].append({"type": "vless", "tag": in_tag, "listen": "127.0.0.1", "listen_port": port, "users": [{"uuid": node["uuid"]}], "transport": {"type": "ws", "path": "/"}})
+        
+        # 16. Dokodemo (内网穿透与链式转发)
         elif proto == "dokodemo-door":
-            singbox_config["inbounds"].append({ "type": "direct", "tag": in_tag, "listen": "::", "listen_port": int(node["port"]) })
+            singbox_config["inbounds"].append({ "type": "direct", "tag": in_tag, "listen": "::", "listen_port": port })
             out_tag = f"out-{node['id']}"
-            
             if node.get("relay_type") == "internal" and node.get("chain_target"):
                 t = node["chain_target"]
                 outbound = { "type": t["protocol"].lower(), "tag": out_tag, "server": t["ip"], "server_port": int(t["port"]), "uuid": t["uuid"] }
-                if t["protocol"] == "Reality":
+                if t["protocol"] == "Reality" or t["protocol"] == "XTLS-Reality":
                     outbound["tls"] = { "enabled": True, "server_name": t["sni"], "reality": { "enabled": True, "public_key": t["public_key"], "short_id": t["short_id"] } }
                 singbox_config["outbounds"].append(outbound)
             else:
                 singbox_config["outbounds"].append({ "type": "direct", "tag": out_tag, "override_address": node["target_ip"], "override_port": int(node["target_port"]) })
-            
             singbox_config["route"]["rules"].append({ "inbound": [in_tag], "outbound": out_tag })
 
+    # 证书清理守护
     try:
         for filename in os.listdir("/opt/kui/"):
             if (filename.startswith("cert_") or filename.startswith("key_")) and filename.endswith(".pem"):
-                if filename not in active_certs:
-                    os.remove(os.path.join("/opt/kui/", filename))
-    except Exception:
-        pass
+                if filename not in active_certs: os.remove(os.path.join("/opt/kui/", filename))
+    except Exception: pass
 
     new_config_str = json.dumps(singbox_config, indent=2)
     old_config_str = ""
     if os.path.exists(SINGBOX_CONF_PATH):
-        with open(SINGBOX_CONF_PATH, "r") as f:
-            old_config_str = f.read()
+        with open(SINGBOX_CONF_PATH, "r") as f: old_config_str = f.read()
 
     if new_config_str != old_config_str:
-        with open(SINGBOX_CONF_PATH, "w") as f:
-            f.write(new_config_str)
-        if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
-            subprocess.run(["rc-service", "sing-box", "restart"])
-        else:
-            subprocess.run(["systemctl", "restart", "sing-box"])
+        with open(SINGBOX_CONF_PATH, "w") as f: f.write(new_config_str)
+        if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"): os.system("rc-service sing-box restart >/dev/null 2>&1")
+        else: os.system("systemctl restart sing-box >/dev/null 2>&1")
 
-# ===============================================
-# 🌟 全新极速主循环引擎 (Fast-Mode)
-# ===============================================
+def fetch_and_apply_configs():
+    try:
+        res = urllib.request.urlopen(urllib.request.Request(f"{API_URL}?ip={VPS_IP}", headers=HEADERS), timeout=10)
+        data = json.loads(res.read().decode('utf-8'))
+        if data.get("success"):
+            nodes = data.get("configs", [])
+            build_singbox_config(nodes)
+            return nodes
+    except Exception: pass
+    return None
+
 if __name__ == "__main__":
     current_active_nodes = []
-    
-    last_config_fetch = 0
-    last_report_time = 0
-    fast_mode = False
-    
-    # 强制进行一次初始抓取
-    time.sleep(1)
-    
+    time.sleep(2)
     while True:
-        now = time.time()
-
-        # 1. 独立时钟：拉取配置固定为 60s (省流防拥堵)
-        if now - last_config_fetch >= 60:
-            fetched_nodes = fetch_and_apply_configs()
-            if fetched_nodes is not None:
-                current_active_nodes = fetched_nodes
-            last_config_fetch = now
-
-        # 2. 独立时钟：探针上报极速变频 (有人看就是2s，没人看就是15s)
-        target_interval = 2 if fast_mode else 15
-        
-        if now - last_report_time >= target_interval:
-            argo_urls = process_argo_nodes(current_active_nodes)
-            res_json = report_status(current_active_nodes, argo_urls)
-            
-            # 解析云端发来的“管理员在看”信号
-            if res_json and isinstance(res_json, dict) and res_json.get("fast_mode"):
-                fast_mode = True
-            else:
-                fast_mode = False
-                
-            last_report_time = time.time()
-        
-        # 内核睡眠时钟：1秒，保证时序精准切变
-        time.sleep(1)
+        fetched_nodes = fetch_and_apply_configs()
+        if fetched_nodes is not None: current_active_nodes = fetched_nodes
+        argo_urls = process_argo_nodes(current_active_nodes)
+        report_status(current_active_nodes, argo_urls)
+        time.sleep(15)
