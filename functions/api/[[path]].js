@@ -117,6 +117,12 @@ async function handleProbeAPI(request, env, context, pathArray) {
         await db.prepare(`UPDATE probe_servers SET name=?, server_group=?, price=?, expire_date=?, bandwidth=?, traffic_limit=?, agent_os=?, is_hidden=? WHERE id=?`).bind(data.name || 'Unnamed', data.server_group || '默认分组', data.price || '', data.expire_date || '', data.bandwidth || '', data.traffic_limit || '', data.agent_os || 'debian', data.is_hidden || 'false', data.id).run();
         return Response.json({ success: true });
     }
+    
+    if (method === 'DELETE' && subPath === 'admin/server') {
+        const id = url.searchParams.get('id');
+        await db.prepare('DELETE FROM probe_servers WHERE id = ?').bind(id).run();
+        return Response.json({ success: true });
+    }
 
     return Response.json({error: "Not Found"}, {status: 404});
 }
@@ -141,14 +147,19 @@ export async function onRequest(context) {
         return Response.json({ success: true });
     }
 
-    // 🌟 Agent 统一探针与管理上报接口 (全能入口，单次上报双向分发)
+    // 🌟 Agent 统一探针与管理上报接口
     if (action === "report" && method === "POST") {
         if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         const data = await request.json(); 
         const nowMs = Date.now();
         const vpsIp = data.ip;
 
-        // 1. 更新 KUI 核心节点数据库
+        const kuiServer = await db.prepare('SELECT name FROM servers WHERE ip = ?').bind(vpsIp).first();
+        if (!kuiServer) {
+            return Response.json({ error: "Server has been removed from KUI panel." }, { status: 403 });
+        }
+        const serverName = kuiServer.name;
+
         try { 
             await db.prepare("UPDATE servers SET cpu=?, mem=?, disk=?, load=?, uptime=?, net_in_speed=?, net_out_speed=?, tcp_conn=?, udp_conn=?, last_report=?, alert_sent=0 WHERE ip=?")
                     .bind(data.cpu||0, data.mem||0, data.disk||0, data.load||'', data.uptime||'', data.net_in_speed||0, data.net_out_speed||0, data.tcp_conn||0, data.udp_conn||0, nowMs, vpsIp).run(); 
@@ -158,10 +169,7 @@ export async function onRequest(context) {
                     .bind(data.cpu||0, data.mem||0, data.disk||0, data.load||'', data.uptime||'', data.net_in_speed||0, data.net_out_speed||0, data.tcp_conn||0, data.udp_conn||0, nowMs, vpsIp).run(); 
         }
 
-        // 2. 桥接同步到 CF 探针大盘数据库
         try {
-            const kuiServer = await db.prepare('SELECT name FROM servers WHERE ip = ?').bind(vpsIp).first();
-            const serverName = kuiServer ? kuiServer.name : vpsIp;
             let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX'; 
             if (countryCode.toUpperCase() === 'TW') countryCode = 'CN';
 
@@ -208,7 +216,6 @@ export async function onRequest(context) {
 
         } catch (e) { console.error("探针数据同步失败:", e); }
 
-        // 3. 处理代理节点流量与协议更新
         const stmts = []; let totalDelta = 0;
         if (data.node_traffic && data.node_traffic.length > 0) { 
             for (let nt of data.node_traffic) { 
@@ -223,7 +230,6 @@ export async function onRequest(context) {
         
         let fastMode = false; try { const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first(); if (uiActive && (nowMs - uiActive.ts < 20000)) fastMode = true; } catch(e) {}
         
-        // 🌟 将系统设置中的上报频率动态下发给 Agent
         let reportInterval = 5;
         try { const r = await db.prepare("SELECT value FROM probe_settings WHERE key = 'report_interval'").first(); if (r && r.value) reportInterval = parseInt(r.value); } catch(e) {}
         
@@ -304,7 +310,11 @@ export async function onRequest(context) {
         
         if (action === "vps" && isAdmin) {
             if (method === "POST") { const { ip, name } = await request.json(); await db.prepare("INSERT OR IGNORE INTO servers (ip, name, alert_sent) VALUES (?, ?, 0)").bind(ip, name).run(); return Response.json({ success: true }); }
-            if (method === "DELETE") { const ip = new URL(request.url).searchParams.get("ip"); await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip) ]); return Response.json({ success: true }); }
+            if (method === "DELETE") { 
+                const ip = new URL(request.url).searchParams.get("ip"); 
+                await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip) ]); 
+                return Response.json({ success: true }); 
+            }
         }
 
         if (action === "nodes" && isAdmin) {
